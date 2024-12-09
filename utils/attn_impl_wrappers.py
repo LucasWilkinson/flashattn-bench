@@ -31,12 +31,22 @@ def is_triton_available():
         return False
 
 
+def is_vllm_flash_available():
+    try:
+        import vllm_flash_attn
+        return True
+    except ImportError:
+        return False
+
+
 ATTN_IMPL_FACTORIES = {}
-def register_attn_factory(name, supported_dtypes, available=True):
+def register_attn_factory(name, supported_dtypes, 
+                          available=True,
+                          supported_page_size=None):
     def decorator(fn):
         global ATTN_IMPL_FACTORIES
         if available:
-            ATTN_IMPL_FACTORIES[name] = (fn, supported_dtypes)
+            ATTN_IMPL_FACTORIES[name] = (fn, supported_dtypes, supported_page_size)
         return fn
     return decorator
 
@@ -129,7 +139,8 @@ def _create_attn_flashX_kvcache_paged_fn(flash_module, ts: TestTensors, c: RunCo
         num_splits=1)
 
 
-def _create_attn_flashX_varlen_paged_fn(flash_module, ts: TestTensors, c: RunConfig):
+def _create_attn_flashX_varlen_paged_fn(
+    flash_module, ts: TestTensors, c: RunConfig, **kwargs):
     softmax_scale = ts.q.shape[-1] ** (-0.5)
     bs, seqlen_q, nheads, head_dim = ts.q.shape
     return lambda: flash_module._flash_attn_varlen_forward(
@@ -141,13 +152,14 @@ def _create_attn_flashX_varlen_paged_fn(flash_module, ts: TestTensors, c: RunCon
         max_seqlen_q=ts.max_seqlen_q,
         max_seqlen_k=ts.max_seqlen_k,
         block_table=ts.page_table,
-        dropout_p=c.dropout_p,
         softmax_scale=softmax_scale,
-        causal=c.causal)[0]\
+        causal=c.causal,
+        **kwargs)[0]\
             .reshape(bs, seqlen_q, nheads, head_dim)
 
 
-def _create_attn_flashX_varlen_fn(flash_module, ts: TestTensors, c: RunConfig):
+def _create_attn_flashX_varlen_fn(
+    flash_module, ts: TestTensors, c: RunConfig, **kwargs):
     softmax_scale = ts.q.shape[-1] ** (-0.5)
     bs, seqlen_q, nheads, head_dim = ts.q.shape
     return lambda: flash_module._flash_attn_varlen_forward(
@@ -158,34 +170,61 @@ def _create_attn_flashX_varlen_fn(flash_module, ts: TestTensors, c: RunConfig):
         cu_seqlens_k=ts.cu_seqlens_k,
         max_seqlen_q=ts.max_seqlen_q,
         max_seqlen_k=ts.max_seqlen_k,
-        dropout_p=c.dropout_p,
         softmax_scale=softmax_scale,
-        causal=c.causal)[0]\
+        causal=c.causal,
+        softcap=0.0,
+        **kwargs)[0]\
             .reshape(bs, seqlen_q, nheads, head_dim)
 
+# dropout_p=c.dropout_p
+
 @register_attn_factory("Flash2", (torch.float16, torch.bfloat16))
-def create_flash2_attention_fn(ts: TestTensors, c: RunConfig):
+def create_attn_flash2_fn(ts: TestTensors, c: RunConfig):
     return _create_attn_flashX_fn(flash_attn_2, ts, c)
 
 @register_attn_factory("Flash3", (torch.float16, torch.bfloat16))
-def create_flash3_attention_fn(ts: TestTensors, c: RunConfig):
+def create_attn_flash3_fn(ts: TestTensors, c: RunConfig):
     return _create_attn_flashX_fn(flash_attn_3, ts, c)
 
-@register_attn_factory("Flash3_kvcache_paged", (torch.float16, torch.bfloat16))
+@register_attn_factory("Flash3_kvcache_paged", (torch.float16, torch.bfloat16), 
+                       supported_page_size=lambda x: x % 256 == 0)
 def create_attn_flash3_kvcache_paged_fn(ts: TestTensors, c: RunConfig):
     return _create_attn_flashX_kvcache_paged_fn(flash_attn_3, ts, c)
 
-@register_attn_factory("Flash2_varlen_paged", (torch.float16, torch.bfloat16))
-def create_attn_flash2_varlen_paged_fn(ts: TestTensors, c: RunConfig):
-    return _create_attn_flashX_varlen_paged_fn(flash_attn_2, ts, c)
+@register_attn_factory("vLLM_Flash_varlen_paged", (torch.float16, torch.bfloat16),
+                       supported_page_size=lambda x: x % 16 == 0)
+def create_attn_vllm_flash_varlen_paged_fn(ts: TestTensors, c: RunConfig):
+    import vllm_flash_attn.flash_attn_interface as vllm_flash_attn
+    return _create_attn_flashX_varlen_paged_fn(
+        vllm_flash_attn, ts, c, 
+        window_size=(-1, -1), alibi_slopes=None, return_softmax=False,
+        softcap=0.0, dropout_p=c.dropout_p)
 
-@register_attn_factory("Flash3_varlen_paged", (torch.float16, torch.bfloat16))
+@register_attn_factory("Flash2_varlen_paged", (torch.float16, torch.bfloat16),
+                       supported_page_size=lambda x: x % 256 == 0)
+def create_attn_flash2_varlen_paged_fn(ts: TestTensors, c: RunConfig):
+    return _create_attn_flashX_varlen_paged_fn(
+        flash_attn_2, ts, c,
+        dropout_p=c.dropout_p)
+
+@register_attn_factory("Flash3_varlen_paged", (torch.float16, torch.bfloat16),
+                       supported_page_size=lambda x: x % 256 == 0)
 def create_attn_flash3_varlen_paged_fn(ts: TestTensors, c: RunConfig):
     return _create_attn_flashX_varlen_paged_fn(flash_attn_3, ts, c)
 
+@register_attn_factory("vLLM_Flash_varlen", (torch.float16, torch.bfloat16))
+def create_attn_vllm_flash_varlen_fn(ts: TestTensors, c: RunConfig):
+    import vllm_flash_attn.flash_attn_interface as vllm_flash_attn
+    return _create_attn_flashX_varlen_fn(
+        vllm_flash_attn, ts, c, 
+        window_size=(-1, -1), alibi_slopes=None, return_softmax=False,
+        softcap=0.0, dropout_p=c.dropout_p)
+
 @register_attn_factory("Flash2_varlen", (torch.float16, torch.bfloat16))
 def create_attn_flash2_varlen_fn(ts: TestTensors, c: RunConfig):
-    return _create_attn_flashX_varlen_fn(flash_attn_2, ts, c)
+    return _create_attn_flashX_varlen_fn(
+        flash_attn_2, ts, c,
+        dropout_p=c.dropout_p)
 
 @register_attn_factory("Flash3_varlen", 
                        (torch.float16, torch.bfloat16, torch.float8_e4m3fn))

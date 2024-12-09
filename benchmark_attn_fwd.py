@@ -64,9 +64,10 @@ class ConfigKey:
     headdim: int
     batch_size: int
     seqlen: int
+    page_size: int
 
     def to_tuple(self):
-        return (self.dim, self.dtype, self.causal, self.headdim, self.batch_size, self.seqlen)
+        return (self.dim, self.dtype, self.causal, self.headdim, self.batch_size, self.seqlen, self.page_size)
 
     @classmethod
     def from_tuple(cls, tup):
@@ -94,6 +95,7 @@ def benchmark_attention_methods(
     dropout_p: float,
     dims: List[int],
     methods: List[str],
+    page_sizes: List[int],
     validate: bool = False,
     profile: bool = False,
     output_path: Optional[str] = None,
@@ -102,9 +104,10 @@ def benchmark_attention_methods(
     speed_f = {}
 
     method_factories = ATTN_IMPL_FACTORIES
-    max_method_width = max(len(m) for m in methods)
+    # +15 for possible page_size info
+    max_method_width = max(len(m) for m in methods) + 16
 
-    val_factory = ATTN_IMPL_FACTORIES["Pytorch"][0]
+    val_factory, val_supported_dtypes = ATTN_IMPL_FACTORIES["Pytorch"][:2]
 
     if profile:
         from torch.cuda import nvtx
@@ -130,96 +133,141 @@ def benchmark_attention_methods(
             )
 
             for dtype in dtypes:
-                config_key = ConfigKey(dim, dtype, causal, headdim, batch_size, seqlen)
-
-                tensors = TestTensors.generate(
-                    dtype=dtype,
-                    batch_size=batch_size,
-                    max_seqlen_q=seqlen,
-                    max_seqlen_kv=seqlen,
-                    nheads_q=nheads,
-                    nheads_kv=nheads,
-                    headdim=headdim,
-                    device=device,
-                    page_size=256,
-                    randomize_page_order=True,
-                )
-
+                # Generate reference output once if validation is needed and not profiling
                 if validate and not profile:
-                    ref_output = val_factory(tensors, config)()
+                    reference_tensors = TestTensors.generate(
+                        dtype=dtype,
+                        batch_size=batch_size,
+                        max_seqlen_q=seqlen,
+                        max_seqlen_kv=seqlen,
+                        nheads_q=nheads,
+                        nheads_kv=nheads,
+                        headdim=headdim,
+                        device=device,
+                        page_size=page_sizes[0],  
+                        randomize_page_order=True,
+                    )
+                    ref_output = val_factory(reference_tensors, config)()
+                    del reference_tensors
 
-                for method in methods:
-                    factory, suppoted_dtypes = method_factories.get(method, (None, []))
-                    
-                    if factory is None:
-                        print(f"Method {method} is not implemented.")
-                        continue
-                    if dtype not in suppoted_dtypes:
-                        print(f"Method {method} does not support dtype {dtype}.")
-                        continue
-                    
-                    try:
-                        fn = factory(tensors, config)
-                    except KeyboardInterrupt:
-                        raise
-                    except Exception as e:
-                        print(f"Cannot create {method} due to {e}")
-                        continue
+                # For each page size, generate tensors once
+                for ps in page_sizes:
+                    tensors = TestTensors.generate(
+                        dtype=dtype,
+                        batch_size=batch_size,
+                        max_seqlen_q=seqlen,
+                        max_seqlen_kv=seqlen,
+                        nheads_q=nheads,
+                        nheads_kv=nheads,
+                        headdim=headdim,
+                        device=device,
+                        page_size=ps,
+                        randomize_page_order=True,
+                    )
 
-                    if profile:
-                        torch.cuda.synchronize()
-                        nvtx_name = f"ATTN-{method}/"
-                        id = nvtx.range_start(nvtx_name)
-                        fn()
-                        nvtx.range_end(id)
-                        torch.cuda.synchronize()
-                        time_f[(config_key, method)] = 0.0
-                        speed_f[(config_key, method)] = 0.0
-                        print(
-                            f"{method.ljust(max_method_width)} "
-                            f"({terse_type_str(dtype):<4}) "
-                            f"ran once for profiling",
-                        )
-                    else:
-                        time_f[(config_key, method)] = time_fwd(
-                            fn, repeats=repeats, verbose=False)
+                    for method in methods:
+                        factory_tuple = method_factories.get(method, None)
+                        if factory_tuple is None:
+                            print(f"Method {method} is not implemented.")
+                            continue
 
-                        speed_f[(config_key, method)] = efficiency(
-                            flops(
-                                torch.tensor([seqlen] * batch_size),  # Adjusted for placeholder
-                                headdim,
-                                nheads,
-                                causal,
-                                mode="fwd",
-                            ),
-                            time_f[(config_key, method)],
-                        )
-                        print(
-                            f"{method.ljust(max_method_width)} "
-                            f"({terse_type_str(dtype):<4}) "
-                            f"fwd: {speed_f[(config_key, method)]:>6.2f} "
-                            f"TFLOPs/s, {time_f[(config_key, method)] * 1e3:6.2f} ms",
-                        )
+                        if len(factory_tuple) == 2:
+                            factory, suppoted_dtypes = factory_tuple
+                            supports_page_size = None
+                        else:
+                            factory, suppoted_dtypes, supports_page_size = factory_tuple
 
-                        if validate:
-                            output = fn()
-                            if method == "cuDNN" and dtype == torch.float8_e4m3fn:
-                                continue
+                        if dtype not in suppoted_dtypes:
+                            print(f"Method {method} does not support dtype {dtype}.")
+                            continue
 
-                            tols = {
-                                torch.float16: 0.05,
-                                torch.bfloat16: 0.05,
-                                torch.float8_e4m3fn: 0.1,
-                            }
-                            torch.testing.assert_close(
-                                output, ref_output.to(output.dtype),
-                                atol=tols[dtype], rtol=tols[dtype]
+                        # Construct method name with page size if supported
+                        method_name = method
+                        if supports_page_size is not None:
+                            method_name = f"{method} (page_size={ps})"
+
+                        # Check paging support
+                        # If no paging support and ps != page_sizes[0], skip
+                        if supports_page_size is None and ps != page_sizes[0]:
+                            continue
+                        # If paging support is available, but doesn't support this ps, skip
+                        if supports_page_size is not None and not supports_page_size(ps):
+                            print(f"Skipping {method_name}, unsupported page_size")
+                            continue
+
+
+
+                        try:
+                            fn = factory(tensors, config)
+                        except Exception as e:
+                            print(f"Cannot create {method_name} due to {e}")
+                            continue
+
+                        # Test run
+                        try:
+                            fn()
+                        except Exception as e:
+                            print(f"Cannot run {method_name} due to {e}")
+                            del fn
+                            continue
+
+                        config_key = ConfigKey(dim, dtype, causal, headdim, batch_size, seqlen, ps)
+
+                        if profile:
+                            torch.cuda.synchronize()
+                            nvtx_name = f"ATTN-{method}/"
+                            id = nvtx.range_start(nvtx_name)
+                            fn()
+                            nvtx.range_end(id)
+                            torch.cuda.synchronize()
+                            time_f[(config_key, method_name)] = 0.0
+                            speed_f[(config_key, method_name)] = 0.0
+                            print(
+                                f"{method_name.ljust(max_method_width)} "
+                                f"({terse_type_str(dtype):<4}) "
+                                f"ran once for profiling",
+                            )
+                        else:
+                            # Actual benchmarking
+                            forward_time = time_fwd(
+                                fn, repeats=repeats, verbose=False)
+                            time_f[(config_key, method_name)] = forward_time
+                            forward_speed = efficiency(
+                                flops(
+                                    torch.tensor([seqlen] * batch_size),
+                                    headdim,
+                                    nheads,
+                                    causal,
+                                    mode="fwd",
+                                ),
+                                forward_time,
+                            )
+                            speed_f[(config_key, method_name)] = forward_speed
+                            print(
+                                f"{method_name.ljust(max_method_width)} "
+                                f"({terse_type_str(dtype):<4}) "
+                                f"fwd: {speed_f[(config_key, method_name)]:>6.2f} "
+                                f"TFLOPs/s, {time_f[(config_key, method_name)] * 1e3:6.2f} ms",
                             )
 
-                    del fn
-                del tensors
-                gc.collect()
-                torch.cuda.empty_cache()
+                            if validate:
+                                output = fn()
+                                # For fp8 cudnn skip validation
+                                if not (method == "cuDNN" and dtype == torch.float8_e4m3fn):
+                                    tols = {
+                                        torch.float16: 0.05,
+                                        torch.bfloat16: 0.05,
+                                        torch.float8_e4m3fn: 0.1,
+                                    }
+                                    torch.testing.assert_close(
+                                        output, ref_output.to(output.dtype),
+                                        atol=tols[dtype], rtol=tols[dtype]
+                                    )
+
+                        del fn
+                    del tensors
+                    gc.collect()
+                    torch.cuda.empty_cache()
 
     except KeyboardInterrupt:
         print("\nBenchmark interrupted by user")
@@ -239,8 +287,6 @@ def parse_bs_seqlen_pairs(args, default: List[Tuple[int, int]]) -> List[Tuple[in
     Parse batch size and sequence length combinations from either:
     1. A list of 'batch_size,seqlen' strings
     2. Separate lists of batch sizes and sequence lengths
-
-    Returns a list of (batch_size, seqlen) tuples representing all combinations.
     """
     if getattr(args, 'bs_seqlen_pairs', None) is not None:
         if getattr(args, 'bss', None) is not None or getattr(args, 'seqlens', None) is not None:
@@ -261,7 +307,8 @@ def run_benchmark(args):
     dtypes = [getattr(torch, dt) for dt in args.dtypes]
     causal_vals = [c == 'True' for c in args.causal]
     head_dims = args.head_dims
-    dims = args.dims  # Use dims list instead of single dim
+    dims = args.dims
+    page_sizes = args.page_sizes
 
     bs_seqlen_pairs = parse_bs_seqlen_pairs(args, default=[
         (32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 16384)])
@@ -280,6 +327,7 @@ def run_benchmark(args):
         dropout_p,
         dims,
         methods,
+        page_sizes=page_sizes,
         validate=args.validate,
         profile=args.profile,
         output_path=args.output_path,
@@ -354,7 +402,6 @@ def create_plot_specs(
             key.append(("seq_len", c.seqlen))
         else:
             key.append(("batch_size", c.batch_size))
-            
         return tuple(key)
 
     num_to_str = lambda x: str(x) if x < 1000 else f"{x//1000}k"
@@ -383,7 +430,6 @@ def create_plot_specs(
         else:
             label = method
             hatch = ''
-
         return label, color, hatch
 
     subplot_specs = OrderedDict()
@@ -411,6 +457,7 @@ def create_plot_specs(
     
     return list(subplot_specs.values())
 
+
 def add_value_labels(ax, bars, rotation=90):
     """Add value labels on top of bars with rotation."""
     max_height = max(bar.get_height() for bar in bars if not np.isnan(bar.get_height()))
@@ -435,7 +482,10 @@ def plot_spec(subplot_specs: List[SubplotSpec], output_path: str, n_cols: Option
     n_rows = (n_plots + n_cols - 1) // n_cols
 
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(8 * n_cols, 6 * n_rows))
-    axes = axes.flatten() if n_plots > 1 else [axes]
+    if n_plots == 1:
+        axes = [axes]
+
+    axes = axes.flatten() if n_plots > 1 else axes
 
     plt.rcParams['patch.linewidth'] = 1.0
 
@@ -467,7 +517,7 @@ def plot_spec(subplot_specs: List[SubplotSpec], output_path: str, n_cols: Option
         ax.set_title(subplot_spec.title)
 
     # Handle legend
-    handles, labels = axes[0].get_legend_handles_labels()
+    handles, labels = axes[0].get_legend_handles_labels() if n_plots > 0 else ([], [])
     fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 1.02), ncol=4)
 
     plt.tight_layout(rect=[0, 0, 1, 0.95])
@@ -561,16 +611,23 @@ def main():
         action='store_true',
         help='Run each kernel once with NVTX annotations for profiling',
     )
+    parser_run.add_argument(
+        '--page-sizes',
+        nargs='+',
+        type=int,
+        default=[32],
+        help='Page sizes to sweep over (for kernels that support paging).'
+    )
 
     parser_plot = subparsers.add_parser('plot', help='Plot benchmark results')
     parser_plot.add_argument('pickle_file', type=str, help='Path to pickle file with benchmark results')
-    parser_plot.add_argument('--output_prefix', type=str, default='attention_benchmark',
+    parser_plot.add_argument('--output-prefix', type=str, default='attention_benchmark',
                           help='Prefix for output plot files')
-    parser_plot.add_argument('--by_total_tokens', action='store_true',
+    parser_plot.add_argument('--by-total-tokens', action='store_true',
                           help='Plot results grouped by total number of tokens (batch_size × seq_len)')
-    parser_plot.add_argument('--merge_dtypes', action='store_true',
+    parser_plot.add_argument('--merge-dtypes', action='store_true',
                           help='Merge different dtypes into the same plot using different patterns')
-    parser_plot.add_argument('--group_by_seqlen', action='store_true',
+    parser_plot.add_argument('--group-by-seqlen', action='store_true',
                           help='When not using total tokens mode, group plots by sequence length instead of batch size')
     parser_plot.add_argument('--ncols', type=int,
                           help='Set ncols for the plot grid')
