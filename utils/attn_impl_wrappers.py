@@ -172,7 +172,6 @@ def _create_attn_flashX_varlen_fn(
         max_seqlen_k=ts.max_seqlen_k,
         softmax_scale=softmax_scale,
         causal=c.causal,
-        softcap=0.0,
         **kwargs)[0]\
             .reshape(bs, seqlen_q, nheads, head_dim)
 
@@ -218,7 +217,7 @@ def create_attn_vllm_flash_varlen_fn(ts: TestTensors, c: RunConfig):
     return _create_attn_flashX_varlen_fn(
         vllm_flash_attn, ts, c, 
         window_size=(-1, -1), alibi_slopes=None, return_softmax=False,
-        softcap=0.0, dropout_p=c.dropout_p)
+        softcap=0.0, dropout_p=c.dropout_p, block_table=None)
 
 @register_attn_factory("Flash2_varlen", (torch.float16, torch.bfloat16))
 def create_attn_flash2_varlen_fn(ts: TestTensors, c: RunConfig):

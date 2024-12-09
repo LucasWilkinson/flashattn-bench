@@ -368,7 +368,7 @@ class SubplotSpec:
 
 
 def create_plot_specs(
-    results, by_total_tokens=False, merge_dtypes=False, group_by_seqlen=False
+    results, by_total_tokens=False, merge_dtypes=False, group_by_seqlen=False, sort_methods=False
 ) -> List[SubplotSpec]:
     import matplotlib.pyplot as plt
     
@@ -382,10 +382,9 @@ def create_plot_specs(
         None: ''
     }
 
-    methods = []
-    for ((_, m), _) in speed_results.items():
-        if m not in methods:
-            methods.append(m)
+    # Gather unique methods
+    methods = set(m for ((_, m), _) in speed_results.items())
+    methods = sorted(methods) if sort_methods else list(methods)
 
     default_colors = plt.get_cmap('Set3').colors
     color_scheme = {}
@@ -393,6 +392,7 @@ def create_plot_specs(
         color_scheme[method] = default_colors[idx % len(default_colors)]
 
     def get_subplot_key(c: ConfigKey):
+        # We keep the same logic for subplot grouping
         key = [("dim", c.dim), ("headdim", c.headdim), ("causal", c.causal)]
         if not merge_dtypes:
             key.append(("dtype", dtype_to_str(c.dtype)))
@@ -413,7 +413,7 @@ def create_plot_specs(
             return num_to_str(c.batch_size)
         else:
             return num_to_str(c.seqlen)
-    
+
     if by_total_tokens:
         x_label = "Batch size, Sequence length"
     elif group_by_seqlen:
@@ -422,15 +422,10 @@ def create_plot_specs(
         x_label = "Sequence length"
     y_label = "Speed (TFLOPs/s)"
 
-    def get_label_color_hatch(c: ConfigKey, method: str):
-        color = color_scheme.get(method, '#808080')
-        if merge_dtypes:
-            hatch = hatch_patterns.get(dtype_to_str(c.dtype), '')
-            label = f'{method} ({dtype_to_str(c.dtype)})'
-        else:
-            label = method
-            hatch = ''
-        return label, color, hatch
+    def get_method_dtype_tuple(c: ConfigKey, method: str):
+        m_name = method
+        d_name = dtype_to_str(c.dtype)
+        return (m_name, d_name)
 
     subplot_specs = OrderedDict()
 
@@ -440,21 +435,31 @@ def create_plot_specs(
             subplot_specs[subplot_key] = SubplotSpec(
                 title=", ".join([f"{k}={v}" for k, v in subplot_key]),
                 x_label=x_label,
-                y_label=y_label)
+                y_label=y_label
+            )
         
         x_tick = get_x_tick(config_key)
-        label, color, hatch = get_label_color_hatch(config_key, m)
-        
+        method_dtype = get_method_dtype_tuple(config_key, m)
+
         if x_tick not in subplot_specs[subplot_key].x_ticks:
             subplot_specs[subplot_key].x_ticks.append(x_tick)
-        if label not in subplot_specs[subplot_key].data:
-            subplot_specs[subplot_key].data[label] = BarPlotData()
-        
-        bar_plot_data = subplot_specs[subplot_key].data[label]
-        bar_plot_data.data[x_tick] = speed
-        bar_plot_data.color = color
-        bar_plot_data.hatch = hatch
-    
+
+        if method_dtype not in subplot_specs[subplot_key].data:
+            subplot_specs[subplot_key].data[method_dtype] = BarPlotData()
+
+        subplot_specs[subplot_key].data[method_dtype].data[x_tick] = speed
+        subplot_specs[subplot_key].data[method_dtype].color = color_scheme.get(m, '#808080')
+        if merge_dtypes:
+            subplot_specs[subplot_key].data[method_dtype].hatch = hatch_patterns.get(method_dtype[1], '')
+        else:
+            subplot_specs[subplot_key].data[method_dtype].hatch = ''
+
+    if sort_methods:
+        for spec in subplot_specs.values():
+            sorted_keys = sorted(spec.data.keys(), key=lambda k: (k[0], k[1]) if merge_dtypes else k[0])
+            reordered_data = OrderedDict((k, spec.data[k]) for k in sorted_keys)
+            spec.data = reordered_data
+
     return list(subplot_specs.values())
 
 
@@ -492,18 +497,26 @@ def plot_spec(subplot_specs: List[SubplotSpec], output_path: str, n_cols: Option
     for i, subplot_spec in enumerate(subplot_specs):
         ax = axes[i]
         all_bars = []
-        n_bars = len(subplot_spec.unique_bars())
+        n_bars = len(subplot_spec.data)
         bar_width =  0.8 / n_bars
-        
-        for bar_id, name in enumerate(subplot_spec.unique_bars()):
+
+        # Convert (method, dtype) keys into display labels just before plotting
+        for bar_id, (method_dtype, bar_data) in enumerate(subplot_spec.data.items()):
+            method_name, dtype_name = method_dtype
+            if dtype_name and dtype_name != 'float16':  
+                # If merging dtypes, append dtype to the method name 
+                label = f"{method_name} ({dtype_name})"
+            else:
+                label = method_name
+
             x_positions = [i - (n_bars-1)*bar_width/2 + bar_id*bar_width 
-                for i in range(len(subplot_spec.x_ticks))]
-            
-            bars = ax.bar(x_positions, subplot_spec.get_data_array(name),
+                           for i in range(len(subplot_spec.x_ticks))]
+
+            bars = ax.bar(x_positions, [bar_data.data.get(x, float('nan')) for x in subplot_spec.x_ticks],
                           bar_width,
-                          color=subplot_spec.data[name].color,
-                          hatch=subplot_spec.data[name].hatch,
-                          label=name,
+                          color=bar_data.color,
+                          hatch=bar_data.hatch,
+                          label=label,
                           edgecolor='#404040', linewidth=1.0)
             all_bars.extend(bars)
 
@@ -532,11 +545,19 @@ def plot_results(args):
         ('seqlen_grouped' if args.group_by_seqlen else 'batchsize_grouped')
     if args.merge_dtypes:
         plot_suffix += '_merged_dtypes'
+    if args.sort_methods:
+        plot_suffix += '_sorted'
+
     output_path = f'{args.output_prefix}_{plot_suffix}.png'
     
     results = load_results(args.pickle_file)
     subplot_specs = create_plot_specs(
-        results, args.by_total_tokens, args.merge_dtypes, args.group_by_seqlen)
+        results, 
+        by_total_tokens=args.by_total_tokens, 
+        merge_dtypes=args.merge_dtypes, 
+        group_by_seqlen=args.group_by_seqlen, 
+        sort_methods=args.sort_methods
+    )
     plot_spec(subplot_specs, output_path, args.ncols)
 
 
@@ -631,6 +652,8 @@ def main():
                           help='When not using total tokens mode, group plots by sequence length instead of batch size')
     parser_plot.add_argument('--ncols', type=int,
                           help='Set ncols for the plot grid')
+    parser_plot.add_argument('--sort-methods', action='store_true',
+                         help='Sort bars by method (kernel) name')
 
     args = parser.parse_args()
 
