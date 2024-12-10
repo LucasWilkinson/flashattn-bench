@@ -7,19 +7,52 @@ from dataclasses import dataclass, field
 from itertools import product
 from typing import Callable, Dict, List, Optional, Tuple, Any
 import torch
-import torch.nn.functional as F
-from einops import rearrange, repeat
+import torch.utils.benchmark as benchmark
 
-from collections import defaultdict, OrderedDict
+from collections import OrderedDict
 import numpy as np
 import os
 
 from utils.test_tensors import TestTensors
 from utils.attn_impl_wrappers import ATTN_IMPL_FACTORIES, RunConfig
 
-from flash_attn.utils.benchmark import benchmark_forward
-from flash_attn.bert_padding import pad_input, unpad_input
-from flash_attn_interface import _flash_attn_forward, _flash_attn_varlen_forward
+
+
+def benchmark_forward(
+    fn, 
+    iters_per_run=1,
+    repeats: Optional[int] = None, 
+    run_as_cuda_graph=True
+):
+    def _run_fn():
+        for _ in range(iters_per_run):
+            fn()
+
+    run_fn = _run_fn
+    if run_as_cuda_graph:
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            _run_fn()
+        
+        run_fn = lambda: graph.replay()
+
+    t = benchmark.Timer(
+        stmt="fn()",
+        globals={"fn": run_fn},
+    )
+
+    time.sleep(1) # Sleep for 1 second to avoid thermal throttling
+    if repeats is not None:
+        m = t.timeit(repeats)
+    else:
+        m = t.adaptive_autorange()
+
+    if m.has_warnings:
+        print(m.warnings)
+
+    return m.median / iters_per_run
+
 
 
 def terse_type_str(dtype: torch.dtype) -> str:
@@ -34,13 +67,7 @@ def round_up(x, multiple):
     return ((x + multiple - 1) // multiple) * multiple
 
 
-def time_fwd(func: Callable, *args, **kwargs) -> float:
-    time.sleep(1)
-    time_f = benchmark_forward(func, *args, **kwargs)
-    return time_f[1].mean
-
-
-def flops(
+def compute_flops(
     seqlens_q: torch.Tensor, 
     headdim: int, 
     nheads_q: int, 
@@ -51,6 +78,8 @@ def flops(
     f = 4 * (seqlens_q ** 2).sum().item() * nheads_q * headdim // (2 if causal else 1)
     return f if mode == "fwd" else (2.5 * f if mode == "bwd" else 3.5 * f)
 
+def iters_per_run_heuristic(flops: float) -> int:
+    return max(1, int(1e10 // flops))
 
 def efficiency(flop: float, time: float) -> float:
     return (flop / time / 1e12) if not math.isnan(time) else 0.0
@@ -96,8 +125,11 @@ def benchmark_attention_methods(
     dims: List[int],
     methods: List[str],
     page_sizes: List[int],
+    paged_kv_cache_size: Optional[int] = None,
     validate: bool = False,
     profile: bool = False,
+    disable_cuda_graphs: bool = False,
+    iters_per_run: Optional[int] = None,
     output_path: Optional[str] = None,
 ) -> Tuple[Dict, Dict]:
     time_f = {}
@@ -133,23 +165,6 @@ def benchmark_attention_methods(
             )
 
             for dtype in dtypes:
-                # Generate reference output once if validation is needed and not profiling
-                if validate and not profile:
-                    reference_tensors = TestTensors.generate(
-                        dtype=dtype,
-                        batch_size=batch_size,
-                        max_seqlen_q=seqlen,
-                        max_seqlen_kv=seqlen,
-                        nheads_q=nheads,
-                        nheads_kv=nheads,
-                        headdim=headdim,
-                        device=device,
-                        page_size=page_sizes[0],  
-                        randomize_page_order=True,
-                    )
-                    ref_output = val_factory(reference_tensors, config)()
-                    del reference_tensors
-
                 # For each page size, generate tensors once
                 for ps in page_sizes:
                     tensors = TestTensors.generate(
@@ -162,8 +177,12 @@ def benchmark_attention_methods(
                         headdim=headdim,
                         device=device,
                         page_size=ps,
-                        randomize_page_order=True,
+                        paged_kv_cache_size=paged_kv_cache_size,
+                        randomize_page_order=False,
                     )
+
+                    if validate and not profile:
+                        ref_output = val_factory(tensors, config)()
 
                     for method in methods:
                         factory_tuple = method_factories.get(method, None)
@@ -181,21 +200,16 @@ def benchmark_attention_methods(
                             print(f"Method {method} does not support dtype {dtype}.")
                             continue
 
-                        # Construct method name with page size if supported
                         method_name = method
                         if supports_page_size is not None:
                             method_name = f"{method} (page_size={ps})"
 
-                        # Check paging support
-                        # If no paging support and ps != page_sizes[0], skip
                         if supports_page_size is None and ps != page_sizes[0]:
                             continue
-                        # If paging support is available, but doesn't support this ps, skip
+
                         if supports_page_size is not None and not supports_page_size(ps):
                             print(f"Skipping {method_name}, unsupported page_size")
                             continue
-
-
 
                         try:
                             fn = factory(tensors, config)
@@ -203,7 +217,6 @@ def benchmark_attention_methods(
                             print(f"Cannot create {method_name} due to {e}")
                             continue
 
-                        # Test run
                         try:
                             fn()
                         except Exception as e:
@@ -229,19 +242,23 @@ def benchmark_attention_methods(
                             )
                         else:
                             # Actual benchmarking
-                            forward_time = time_fwd(
-                                fn, repeats=repeats, verbose=False)
-                            time_f[(config_key, method_name)] = forward_time
-                            forward_speed = efficiency(
-                                flops(
-                                    torch.tensor([seqlen] * batch_size),
-                                    headdim,
-                                    nheads,
-                                    causal,
-                                    mode="fwd",
-                                ),
-                                forward_time,
+                            flops = compute_flops(
+                                torch.tensor([seqlen] * batch_size),
+                                headdim,
+                                nheads,
+                                causal,
+                                mode="fwd",
                             )
+                            
+                            if iters_per_run is None:
+                                iters_per_run = iters_per_run_heuristic(flops)
+                            
+                            forward_time = benchmark_forward(
+                                fn, repeats=repeats, 
+                                iters_per_run=iters_per_run,
+                                run_as_cuda_graph=not disable_cuda_graphs)
+                            time_f[(config_key, method_name)] = forward_time
+                            forward_speed = efficiency(flops, forward_time)
                             speed_f[(config_key, method_name)] = forward_speed
                             print(
                                 f"{method_name.ljust(max_method_width)} "
@@ -301,36 +318,28 @@ def parse_bs_seqlen_pairs(args, default: List[Tuple[int, int]]) -> List[Tuple[in
 
 
 def run_benchmark(args):
-    methods = args.methods
-    repeats = args.repeats
-    device = args.device
-    dtypes = [getattr(torch, dt) for dt in args.dtypes]
-    causal_vals = [c == 'True' for c in args.causal]
-    head_dims = args.head_dims
-    dims = args.dims
-    page_sizes = args.page_sizes
-
     bs_seqlen_pairs = parse_bs_seqlen_pairs(args, default=[
         (32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 16384)])
-
-    dropout_p = args.dropout_p
 
     torch.manual_seed(0)
 
     benchmark_attention_methods(
-        causal_vals,
-        head_dims,
-        bs_seqlen_pairs,
-        dtypes,
-        repeats,
-        device,
-        dropout_p,
-        dims,
-        methods,
-        page_sizes=page_sizes,
+        causal_vals=[c == 'True' for c in args.causal],
+        head_dims=args.head_dims,
+        bs_seqlen_pairs=bs_seqlen_pairs,
+        dtypes=[getattr(torch, dt) for dt in args.dtypes],
+        repeats=args.repeats,
+        device=args.device,
+        dropout_p=args.dropout_p,
+        dims=args.dims,
+        methods=args.methods,
+        page_sizes=args.page_sizes,
+        paged_kv_cache_size=args.paged_kv_cache_size,
         validate=args.validate,
         profile=args.profile,
         output_path=args.output_path,
+        disable_cuda_graphs=args.disable_cuda_graphs,
+        iters_per_run=args.iters_per_run,
     )
 
 
@@ -633,11 +642,27 @@ def main():
         help='Run each kernel once with NVTX annotations for profiling',
     )
     parser_run.add_argument(
+        '--disable-cuda-graphs',
+        action='store_true',
+        help='Don\'t run kernels in CUDA graphs',
+    )
+    parser_run.add_argument(
+        '--iters-per-run',
+        type=int,
+        help='Number of iterations run in a loop per timed run '
+             '(and bundled into a single CUDA graph if not disabled)',
+    )
+    parser_run.add_argument(
         '--page-sizes',
         nargs='+',
         type=int,
         default=[32],
         help='Page sizes to sweep over (for kernels that support paging).'
+    )
+    parser_run.add_argument(
+        '--paged-kv-cache-size',
+        type=int,
+        help='Paged KV cache size (if none is seqlen)'
     )
 
     parser_plot = subparsers.add_parser('plot', help='Plot benchmark results')

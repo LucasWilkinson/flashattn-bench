@@ -84,6 +84,7 @@ class TestTensors:
         query_padding_mask_mode: str="full", # opt "full", "random", "third"
         key_padding_mask_mode: str="full", # opt "full", "random", "third"
         page_size: Optional[int]=None,
+        paged_kv_cache_size: Optional[int]=None,
         randomize_page_order: bool = True
     ) -> 'TestTensors':
         rand_dtype = torch.float16 if dtype == torch.float8_e4m3fn else dtype
@@ -146,11 +147,15 @@ class TestTensors:
             1, 1, 1, 1, dtype=torch.float32, device=device)
         
         if page_size:
+            paged_kv_cache_size = paged_kv_cache_size or k.shape[1]
+            paged_kv_cache_size = round_up(paged_kv_cache_size, page_size)
+            assert paged_kv_cache_size is not None
+            
             k_padded = torch.zeros(
-                k.shape[0], round_up(k.shape[1], page_size), *k.shape[2:],  
+                k.shape[0], paged_kv_cache_size, *k.shape[2:],  
                 device=device, dtype=k.dtype, requires_grad=False).detach()
             v_padded = torch.zeros(
-                v.shape[0], round_up(v.shape[1], page_size), *v.shape[2:],
+                v.shape[0], paged_kv_cache_size, *v.shape[2:],
                 device=device, dtype=v.dtype, requires_grad=False).detach()
             k_padded[:, :max_seqlen_kv, ...] = k
             v_padded[:, :max_seqlen_kv, ...] = v
@@ -164,7 +169,7 @@ class TestTensors:
             
             page_table = rearrange(
                 torch.arange(total_pages, device=device, dtype=torch.int32),
-                "(b s) -> b s", s=round_up(max_seqlen_kv, page_size) // page_size)
+                "(b s) -> b s", s=paged_kv_cache_size // page_size)
             
             if randomize_page_order:
                 perm = torch.randperm(total_pages, device=device)
