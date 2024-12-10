@@ -85,7 +85,7 @@ class TestTensors:
         key_padding_mask_mode: str="full", # opt "full", "random", "third"
         page_size: Optional[int]=None,
         paged_kv_cache_size: Optional[int]=None,
-        randomize_page_order: bool = True
+        page_order: str = "sequential", # opt "sequential", "random", "reverse"
     ) -> 'TestTensors':
         rand_dtype = torch.float16 if dtype == torch.float8_e4m3fn else dtype
         common_args = dict(
@@ -171,8 +171,11 @@ class TestTensors:
                 torch.arange(total_pages, device=device, dtype=torch.int32),
                 "(b s) -> b s", s=paged_kv_cache_size // page_size)
             
-            if randomize_page_order:
+            if page_order == "reverse":
+                perm = torch.arange(total_pages - 1, -1, -1, device=device)
+            if page_order == "random":
                 perm = torch.randperm(total_pages, device=device)
+            if page_order in ["reverse", "random"]:
                 if k_paged.dtype == torch.float8_e4m3fn:
                     assert v_paged.dtype == torch.float8_e4m3fn
                     k_paged = k_paged.view(dtype=torch.uint8)[perm, ...].view(dtype=k_padded.dtype)

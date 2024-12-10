@@ -126,6 +126,7 @@ def benchmark_attention_methods(
     methods: List[str],
     page_sizes: List[int],
     paged_kv_cache_size: Optional[int] = None,
+    page_order: str = "sequential",
     validate: bool = False,
     profile: bool = False,
     disable_cuda_graphs: bool = False,
@@ -178,7 +179,7 @@ def benchmark_attention_methods(
                         device=device,
                         page_size=ps,
                         paged_kv_cache_size=paged_kv_cache_size,
-                        randomize_page_order=False,
+                        page_order=page_order,
                     )
 
                     if validate and not profile:
@@ -335,6 +336,7 @@ def run_benchmark(args):
         methods=args.methods,
         page_sizes=args.page_sizes,
         paged_kv_cache_size=args.paged_kv_cache_size,
+        page_order=args.page_order,
         validate=args.validate,
         profile=args.profile,
         output_path=args.output_path,
@@ -557,7 +559,8 @@ def plot_results(args):
     if args.sort_methods:
         plot_suffix += '_sorted'
 
-    output_path = f'{args.output_prefix}_{plot_suffix}.png'
+    output_prefix = args.output_prefix or args.pickle_file.replace('.pkl', '')
+    output_path = f'{output_prefix}_{plot_suffix}.png'
     
     results = load_results(args.pickle_file)
     subplot_specs = create_plot_specs(
@@ -664,10 +667,17 @@ def main():
         type=int,
         help='Paged KV cache size (if none is seqlen)'
     )
+    parser_run.add_argument(
+        '--page-order',
+        type=str,
+        default='reverse',
+        choices=['sequential', 'random', 'reverse'],
+        help='Page order for paged attention'
+    )
 
     parser_plot = subparsers.add_parser('plot', help='Plot benchmark results')
     parser_plot.add_argument('pickle_file', type=str, help='Path to pickle file with benchmark results')
-    parser_plot.add_argument('--output-prefix', type=str, default='attention_benchmark',
+    parser_plot.add_argument('--output-prefix', type=str,
                           help='Prefix for output plot files')
     parser_plot.add_argument('--by-total-tokens', action='store_true',
                           help='Plot results grouped by total number of tokens (batch_size × seq_len)')
